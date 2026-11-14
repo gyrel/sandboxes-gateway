@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -189,9 +190,12 @@ func TestTrackedGitForwardRejectsReplacedGatewayProcess(t *testing.T) {
 }
 
 type forwardAPIFixture struct {
-	mu       sync.Mutex
-	forwards []forwardAPI
-	response forwardAPI
+	mu                     sync.Mutex
+	forwards               []forwardAPI
+	response               forwardAPI
+	unexposeErr            bool
+	listErrAfterUnexposure bool
+	unexposeCount          int
 }
 
 func (f *forwardAPIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +203,10 @@ func (f *forwardAPIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	switch r.URL.Path {
 	case "/services/forwarder/all":
+		if f.listErrAfterUnexposure && f.unexposeCount > 0 {
+			http.Error(w, "verification unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(f.forwards)
 	case "/services/forwarder/expose-git-daemon":
@@ -206,6 +214,11 @@ func (f *forwardAPIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(f.response)
 	case "/services/forwarder/unexpose":
+		f.unexposeCount++
+		if f.unexposeErr {
+			http.Error(w, "unexpose unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		var request forwardAPI
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -256,14 +269,21 @@ func newForwardAPIFixture(t *testing.T, response forwardAPI) (*Manager, *forward
 		procs: map[string]process{
 			"fixture": {
 				cmd:       &exec.Cmd{},
-				done:      make(chan struct{}),
+				done:      closedSignal(),
 				apiSocket: apiPath,
+				lease:     io.NopCloser(strings.NewReader("")),
 				forwardMu: &sync.Mutex{},
 			},
 		},
 		starting: make(map[string]chan struct{}),
 	}
 	return manager, fixture
+}
+
+func closedSignal() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
 }
 
 func TestSetGitDaemonAllocatesVerifiesAndWithdrawsOwnedForward(t *testing.T) {
@@ -306,6 +326,76 @@ func TestSetGitDaemonRejectsWrongGuestAndCleansAllocatedLoopback(t *testing.T) {
 	fixture.mu.Unlock()
 	if len(remaining) != 0 {
 		t.Fatalf("unexpected listener was not withdrawn: %+v", remaining)
+	}
+}
+
+func TestSetGitDaemonUnpublishFailureStopsOwnedGateway(t *testing.T) {
+	assertFailureStopsOwnedGateway(t, func(fixture *forwardAPIFixture) {
+		fixture.unexposeErr = true
+	})
+}
+
+func TestSetGitDaemonUnpublishVerificationFailureStopsOwnedGateway(t *testing.T) {
+	assertFailureStopsOwnedGateway(t, func(fixture *forwardAPIFixture) {
+		fixture.listErrAfterUnexposure = true
+	})
+}
+
+func TestSetGitDaemonCleanupLeavesReplacementGatewayUntouched(t *testing.T) {
+	want := forwardAPI{Local: "127.0.0.1:49152", Remote: gitDaemonRemote, Protocol: protocolTCP}
+	manager, fixture := newForwardAPIFixture(t, want)
+	if _, err := manager.SetGitDaemon(context.Background(), "fixture", true); err != nil {
+		t.Fatalf("SetGitDaemon(enable): %v", err)
+	}
+	fixture.unexposeErr = true
+	replacement := process{cmd: &exec.Cmd{}, done: closedSignal(), forwardMu: &sync.Mutex{}}
+	manager.procs["fixture"] = process{
+		cmd:        manager.procs["fixture"].cmd,
+		done:       closedSignal(),
+		apiSocket:  manager.procs["fixture"].apiSocket,
+		forwardMu:  manager.procs["fixture"].forwardMu,
+		gitForward: manager.procs["fixture"].gitForward,
+		lease: callbackCloser{callback: func() {
+			manager.mu.Lock()
+			manager.procs["fixture"] = replacement
+			manager.mu.Unlock()
+		}},
+	}
+	old := manager.procs["fixture"]
+	if _, err := manager.SetGitDaemon(context.Background(), "fixture", false); err == nil {
+		t.Fatal("SetGitDaemon(disable) succeeded despite unexpose failure")
+	}
+	manager.mu.Lock()
+	got := manager.procs["fixture"]
+	manager.mu.Unlock()
+	if got.cmd != replacement.cmd {
+		t.Fatalf("replacement process was modified: got cmd %p, want %p (old=%p)", got.cmd, replacement.cmd, old.cmd)
+	}
+}
+
+type callbackCloser struct{ callback func() }
+
+func (c callbackCloser) Close() error {
+	c.callback()
+	return nil
+}
+
+func assertFailureStopsOwnedGateway(t *testing.T, configure func(*forwardAPIFixture)) {
+	t.Helper()
+	want := forwardAPI{Local: "127.0.0.1:49152", Remote: gitDaemonRemote, Protocol: protocolTCP}
+	manager, fixture := newForwardAPIFixture(t, want)
+	if _, err := manager.SetGitDaemon(context.Background(), "fixture", true); err != nil {
+		t.Fatalf("SetGitDaemon(enable): %v", err)
+	}
+	configure(fixture)
+	if _, err := manager.SetGitDaemon(context.Background(), "fixture", false); err == nil {
+		t.Fatal("SetGitDaemon(disable) succeeded despite uncertain unpublish state")
+	}
+	manager.mu.Lock()
+	_, stillOwned := manager.procs["fixture"]
+	manager.mu.Unlock()
+	if stillOwned {
+		t.Fatal("gateway process remained running after uncertain Git listener cleanup")
 	}
 }
 

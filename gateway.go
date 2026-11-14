@@ -479,6 +479,11 @@ func (m *Manager) stopProcessAndCleanup(ctx context.Context, name string, p proc
 	if err := m.stopProcess(ctx, name, p); err != nil {
 		return err
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.procs[name]; ok && current.cmd != p.cmd {
+		return errors.New("gateway process changed before endpoint cleanup; replacement was left untouched")
+	}
 	if err := m.removeOwnedSocket(p.socket); err != nil {
 		return fmt.Errorf("remove gateway socket: %w", err)
 	}
@@ -1070,11 +1075,11 @@ func (m *Manager) disableGitDaemon(ctx context.Context, name string, proc proces
 		return 0, m.failClosedGitForward(name, proc, errors.New("owned Git daemon forward disappeared or changed before unpublish"))
 	}
 	if err := postForwardAuth(ctx, proc.apiSocket, proc.apiToken, "/services/forwarder/unexpose", *tracked); err != nil {
-		return 0, err
+		return 0, m.failClosedGitForward(name, proc, fmt.Errorf("unpublish owned Git daemon forward: %w", err))
 	}
 	after, err := listForwardsAuth(ctx, proc.apiSocket, proc.apiToken)
 	if err != nil {
-		return 0, err
+		return 0, m.failClosedGitForward(name, proc, fmt.Errorf("verify Git daemon forward unpublish: %w", err))
 	}
 	if containsForward(after, *tracked) {
 		return 0, m.failClosedGitForward(name, proc, errors.New("gateway retained the Git daemon forward after unpublish"))
