@@ -193,6 +193,7 @@ type forwardAPIFixture struct {
 	mu                     sync.Mutex
 	forwards               []forwardAPI
 	response               forwardAPI
+	replacementAfterRemove *forwardAPI
 	unexposeErr            bool
 	listErrAfterUnexposure bool
 	unexposeCount          int
@@ -231,6 +232,9 @@ func (f *forwardAPIFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.forwards = retained
+		if f.replacementAfterRemove != nil {
+			f.forwards = append(f.forwards, *f.replacementAfterRemove)
+		}
 		w.WriteHeader(http.StatusOK)
 	case "/services/forwarder/expose":
 		var request forwardAPI
@@ -338,6 +342,13 @@ func TestSetGitDaemonUnpublishFailureStopsOwnedGateway(t *testing.T) {
 func TestSetGitDaemonUnpublishVerificationFailureStopsOwnedGateway(t *testing.T) {
 	assertFailureStopsOwnedGateway(t, func(fixture *forwardAPIFixture) {
 		fixture.listErrAfterUnexposure = true
+	})
+}
+
+func TestSetGitDaemonMismatchedListenerAfterUnpublishStopsOwnedGateway(t *testing.T) {
+	assertFailureStopsOwnedGateway(t, func(fixture *forwardAPIFixture) {
+		mismatched := forwardAPI{Local: "127.0.0.1:49152", Remote: "192.168.127.3:22", Protocol: protocolTCP}
+		fixture.replacementAfterRemove = &mismatched
 	})
 }
 

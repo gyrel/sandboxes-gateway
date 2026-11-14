@@ -1081,8 +1081,8 @@ func (m *Manager) disableGitDaemon(ctx context.Context, name string, proc proces
 	if err != nil {
 		return 0, m.failClosedGitForward(name, proc, fmt.Errorf("verify Git daemon forward unpublish: %w", err))
 	}
-	if containsForward(after, *tracked) {
-		return 0, m.failClosedGitForward(name, proc, errors.New("gateway retained the Git daemon forward after unpublish"))
+	if containsForwardAt(after, tracked.Protocol, tracked.Local) {
+		return 0, m.failClosedGitForward(name, proc, errors.New("gateway retained a listener at the Git daemon address after unpublish"))
 	}
 	if err := m.recordGitForward(name, proc, forwardAPI{}); err != nil {
 		return 0, err
