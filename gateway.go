@@ -25,11 +25,12 @@ import (
 )
 
 const (
-	protocolTCP = "tcp"
-	protocolUDP = "udp"
-	guestIP     = "192.168.127.3"
-	deviceIP    = "192.168.127.2"
-	gatewayIP   = "192.168.127.1"
+	protocolTCP  = "tcp"
+	protocolUDP  = "udp"
+	ipv4Loopback = "127.0.0.1"
+	guestIP      = "192.168.127.3"
+	deviceIP     = "192.168.127.2"
+	gatewayIP    = "192.168.127.1"
 	// IPv6 host-services translation uses a guest-visible ULA outside the
 	// guest /64. It is rendered only when the experimental IPv6 capability is
 	// explicitly enabled; it is not a default NAT66 route.
@@ -75,16 +76,18 @@ type Network struct {
 }
 
 type process struct {
-	cmd       *exec.Cmd
-	done      chan struct{}
-	socket    string
-	cfgPath   string
-	logPath   string
-	apiSocket string
-	apiToken  string
-	tokenPath string
-	revision  int
-	lease     io.Closer
+	cmd        *exec.Cmd
+	done       chan struct{}
+	socket     string
+	cfgPath    string
+	logPath    string
+	apiSocket  string
+	apiToken   string
+	tokenPath  string
+	revision   int
+	lease      io.Closer
+	forwardMu  *sync.Mutex
+	gitForward *forwardAPI
 	// stopping marks an orderly stop so the exit watcher does not report a
 	// host-initiated shutdown as an unexpected gateway loss.
 	stopping bool
@@ -307,7 +310,7 @@ func (m *Manager) launch(ctx context.Context, p policy.Policy, socket, cfgPath, 
 		_ = lease.Close()
 		close(done)
 	}()
-	proc := process{cmd: cmd, done: done, socket: socket, cfgPath: cfgPath, logPath: logPath, apiSocket: apiSocket, apiToken: apiToken, tokenPath: tokenPath, revision: p.Revision, lease: lease}
+	proc := process{cmd: cmd, done: done, socket: socket, cfgPath: cfgPath, logPath: logPath, apiSocket: apiSocket, apiToken: apiToken, tokenPath: tokenPath, revision: p.Revision, lease: lease, forwardMu: &sync.Mutex{}}
 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
@@ -395,6 +398,10 @@ func (m *Manager) markStopping(name string, p process) {
 // be recreated instead of silently keeping a running VM without network.
 func (m *Manager) watch(name string, proc process, done <-chan struct{}) {
 	<-done
+	if proc.forwardMu != nil {
+		proc.forwardMu.Lock()
+		defer proc.forwardMu.Unlock()
+	}
 	m.mu.Lock()
 	current, ok := m.procs[name]
 	unexpected := ok && current.cmd == proc.cmd && !current.stopping
@@ -448,6 +455,10 @@ func (m *Manager) removeOwnedSocket(path string) error {
 func (m *Manager) Stop(ctx context.Context, name string) error {
 	m.mu.Lock()
 	p, ok := m.procs[name]
+	if ok && p.forwardMu == nil {
+		p.forwardMu = &sync.Mutex{}
+		m.procs[name] = p
+	}
 	_, starting := m.starting[name]
 	m.mu.Unlock()
 	switch {
@@ -456,8 +467,22 @@ func (m *Manager) Stop(ctx context.Context, name string) error {
 	case !ok:
 		return m.clearStaleSockets(name)
 	}
+	p.forwardMu.Lock()
+	defer p.forwardMu.Unlock()
+	if !m.isCurrentProcess(name, p) {
+		return nil
+	}
+	return m.stopProcessAndCleanup(ctx, name, p)
+}
+
+func (m *Manager) stopProcessAndCleanup(ctx context.Context, name string, p process) error {
 	if err := m.stopProcess(ctx, name, p); err != nil {
 		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.procs[name]; ok && current.cmd != p.cmd {
+		return errors.New("gateway process changed before endpoint cleanup; replacement was left untouched")
 	}
 	if err := m.removeOwnedSocket(p.socket); err != nil {
 		return fmt.Errorf("remove gateway socket: %w", err)
@@ -838,7 +863,7 @@ func renderConfig(p policy.Policy, dnsUpstream string, ipv6Enabled bool) string 
 	if dnsUpstream != "" {
 		fmt.Fprintf(&b, "  dnsUpstream: %s\n", strconv.Quote(dnsUpstream))
 	}
-	b.WriteString("  nat:\n    192.168.127.254: 127.0.0.1\n")
+	b.WriteString("  nat:\n    192.168.127.254: " + ipv4Loopback + "\n")
 	if ipv6Enabled {
 		// Explicit host-services mapping, not NAT66 by default. The guest
 		// destination is outside the guest /64 so policy and audit keep the
@@ -911,10 +936,16 @@ type forwardAPI struct {
 func (m *Manager) SetPorts(ctx context.Context, name string, ports []policy.Port) error {
 	m.mu.Lock()
 	proc, ok := m.procs[name]
+	if ok && proc.forwardMu == nil {
+		proc.forwardMu = &sync.Mutex{}
+		m.procs[name] = proc
+	}
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("gateway for %s is not running", name)
 	}
+	proc.forwardMu.Lock()
+	defer proc.forwardMu.Unlock()
 	if err := validatePolicyPorts(ports); err != nil {
 		return err
 	}
@@ -928,7 +959,278 @@ func (m *Manager) SetPorts(ctx context.Context, name string, ports []policy.Port
 	if err != nil {
 		return err
 	}
-	return applyForwardDiffAuth(ctx, proc.apiSocket, proc.apiToken, current, desiredForwards(ports))
+	desired := desiredForwards(ports)
+	m.mu.Lock()
+	latest, stillRunning := m.procs[name]
+	if !stillRunning || latest.cmd != proc.cmd {
+		m.mu.Unlock()
+		return errors.New("gateway changed while reconciling ports")
+	}
+	gitForward := latest.gitForward
+	m.mu.Unlock()
+	if gitForward != nil {
+		if err := addManagedGitForward(desired, *gitForward); err != nil {
+			return err
+		}
+	}
+	return applyForwardDiffAuth(ctx, proc.apiSocket, proc.apiToken, current, desired)
+}
+
+func addManagedGitForward(desired map[string]forwardAPI, managed forwardAPI) error {
+	key := forwardKey(managed.Protocol, managed.Local)
+	if _, exists := desired[key]; exists {
+		return fmt.Errorf("configured port conflicts with the managed Git daemon forward at %q", managed.Local)
+	}
+	desired[key] = managed
+	return nil
+}
+
+const gitDaemonRemote = guestIP + ":9418"
+
+// SetGitDaemon owns the narrow host-loopback forwarding used by clone mode.
+// It never accepts an arbitrary guest endpoint or host bind address.
+func (m *Manager) SetGitDaemon(ctx context.Context, name string, enabled bool) (uint16, error) {
+	proc, ok := m.processForwards(name)
+	if !ok {
+		return 0, fmt.Errorf("gateway for %s is not running", name)
+	}
+	proc.forwardMu.Lock()
+	defer proc.forwardMu.Unlock()
+	if err := waitServicesAPI(ctx, proc); err != nil {
+		return 0, err
+	}
+	tracked, err := m.trackedGitForward(name, proc)
+	if err != nil {
+		return 0, err
+	}
+	current, err := listForwardsAuth(ctx, proc.apiSocket, proc.apiToken)
+	if err != nil {
+		return 0, err
+	}
+	if enabled {
+		return m.enableGitDaemon(ctx, name, proc, tracked, current)
+	}
+	return m.disableGitDaemon(ctx, name, proc, tracked, current)
+}
+
+func (m *Manager) processForwards(name string) (process, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	proc, ok := m.procs[name]
+	if ok && proc.forwardMu == nil {
+		proc.forwardMu = &sync.Mutex{}
+		m.procs[name] = proc
+	}
+	return proc, ok
+}
+
+func (m *Manager) trackedGitForward(name string, proc process) (*forwardAPI, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	latest, ok := m.procs[name]
+	if !ok || latest.cmd != proc.cmd {
+		return nil, errors.New("gateway changed while managing Git daemon forward")
+	}
+	return latest.gitForward, nil
+}
+
+func (m *Manager) enableGitDaemon(ctx context.Context, name string, proc process, tracked *forwardAPI, current []forwardAPI) (uint16, error) {
+	if tracked != nil {
+		if !containsForward(current, *tracked) {
+			return 0, m.failClosedGitForward(name, proc, errors.New("owned Git daemon forward disappeared or changed"))
+		}
+		return validateGitDaemonForward(*tracked)
+	}
+	for _, existing := range current {
+		if existing.Remote == gitDaemonRemote && normalizeForwardProtocol(existing.Protocol) == protocolTCP {
+			return 0, fmt.Errorf("git daemon endpoint already has an unmanaged forward at %q", existing.Local)
+		}
+	}
+	response, err := postGitDaemonExpose(ctx, proc.apiSocket, proc.apiToken)
+	if err != nil {
+		return 0, err
+	}
+	port, err := validateGitDaemonForward(response)
+	if err != nil {
+		return 0, errors.Join(err, m.revokeAllocatedGitForward(ctx, name, proc, response))
+	}
+	observed, err := listForwardsAuth(ctx, proc.apiSocket, proc.apiToken)
+	if err != nil {
+		return 0, errors.Join(err, m.revokeAllocatedGitForward(ctx, name, proc, response))
+	}
+	if !containsForward(observed, response) {
+		return 0, errors.Join(errors.New("gateway did not retain the exact Git daemon forward"), m.revokeAllocatedGitForward(ctx, name, proc, response))
+	}
+	if err := m.recordGitForward(name, proc, response); err != nil {
+		return 0, errors.Join(err, m.revokeAllocatedGitForward(ctx, name, proc, response))
+	}
+	return port, nil
+}
+
+func (m *Manager) disableGitDaemon(ctx context.Context, name string, proc process, tracked *forwardAPI, current []forwardAPI) (uint16, error) {
+	if tracked == nil {
+		return 0, nil
+	}
+	if !containsForward(current, *tracked) {
+		return 0, m.failClosedGitForward(name, proc, errors.New("owned Git daemon forward disappeared or changed before unpublish"))
+	}
+	if err := postForwardAuth(ctx, proc.apiSocket, proc.apiToken, "/services/forwarder/unexpose", *tracked); err != nil {
+		return 0, m.failClosedGitForward(name, proc, fmt.Errorf("unpublish owned Git daemon forward: %w", err))
+	}
+	after, err := listForwardsAuth(ctx, proc.apiSocket, proc.apiToken)
+	if err != nil {
+		return 0, m.failClosedGitForward(name, proc, fmt.Errorf("verify Git daemon forward unpublish: %w", err))
+	}
+	if containsForwardAt(after, tracked.Protocol, tracked.Local) {
+		return 0, m.failClosedGitForward(name, proc, errors.New("gateway retained a listener at the Git daemon address after unpublish"))
+	}
+	if err := m.recordGitForward(name, proc, forwardAPI{}); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+func (m *Manager) recordGitForward(name string, proc process, forward forwardAPI) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	latest, ok := m.procs[name]
+	if !ok || latest.cmd != proc.cmd {
+		return errors.New("gateway changed before recording Git daemon forward ownership")
+	}
+	if forward.Local == "" {
+		latest.gitForward = nil
+	} else {
+		owned := forward
+		latest.gitForward = &owned
+	}
+	m.procs[name] = latest
+	return nil
+}
+
+func (m *Manager) isCurrentProcess(name string, proc process) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.procs[name]
+	return ok && current.cmd == proc.cmd
+}
+
+func (m *Manager) revokeAllocatedGitForward(ctx context.Context, name string, proc process, response forwardAPI) error {
+	if !m.isCurrentProcess(name, proc) {
+		return errors.New("gateway changed before unexpected Git daemon listener cleanup; old process has exited")
+	}
+	if !isGitLoopbackForward(response) {
+		return m.failClosedGitForward(name, proc, errors.New("cannot safely identify allocated Git daemon listener for cleanup"))
+	}
+	if err := postForwardAuth(ctx, proc.apiSocket, proc.apiToken, "/services/forwarder/unexpose", response); err != nil {
+		return errors.Join(err, m.failClosedGitForward(name, proc, errors.New("failed to withdraw unexpected Git daemon listener")))
+	}
+	remaining, err := listForwardsAuth(ctx, proc.apiSocket, proc.apiToken)
+	if err != nil || containsForwardAt(remaining, response.Protocol, response.Local) {
+		return errors.Join(err, m.failClosedGitForward(name, proc, errors.New("could not verify Git daemon listener cleanup")))
+	}
+	return nil
+}
+
+func (m *Manager) failClosedGitForward(name string, proc process, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !m.isCurrentProcess(name, proc) {
+		return errors.Join(cause, errors.New("gateway process changed; did not modify its replacement"))
+	}
+	return errors.Join(cause, m.stopProcessAndCleanup(ctx, name, proc))
+}
+
+func postGitDaemonExpose(ctx context.Context, endpoint, token string) (forwardAPI, error) {
+	if err := validateGatewayAPIAuth(endpoint, token); err != nil {
+		return forwardAPI{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://gvproxy/services/forwarder/expose-git-daemon", http.NoBody)
+	if err != nil {
+		return forwardAPI{}, err
+	}
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	client, err := gatewayHTTPClient(endpoint)
+	if err != nil {
+		return forwardAPI{}, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return forwardAPI{}, fmt.Errorf("allocate Git daemon forward: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		return forwardAPI{}, fmt.Errorf("allocate Git daemon forward: status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4096))
+	decoder.DisallowUnknownFields()
+	var result forwardAPI
+	if err := decoder.Decode(&result); err != nil {
+		return forwardAPI{}, fmt.Errorf("decode Git daemon forward: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return forwardAPI{}, errors.New("decode Git daemon forward: unexpected trailing data")
+	}
+	return result, nil
+}
+
+func validateGitDaemonForward(forward forwardAPI) (uint16, error) {
+	if forward.Protocol != protocolTCP || forward.Remote != gitDaemonRemote {
+		return 0, errors.New("gateway returned an unexpected Git daemon protocol or guest endpoint")
+	}
+	return parseLoopbackPort(forward.Local)
+}
+
+func isGitLoopbackForward(forward forwardAPI) bool {
+	if normalizeForwardProtocol(forward.Protocol) != protocolTCP {
+		return false
+	}
+	_, err := parseLoopbackPort(forward.Local)
+	return err == nil
+}
+
+func parseLoopbackPort(local string) (uint16, error) {
+	host, portText, err := net.SplitHostPort(local)
+	if err != nil || host != ipv4Loopback {
+		return 0, errors.New("gateway Git daemon listener is not bound to IPv4 loopback")
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return 0, errors.New("gateway Git daemon listener has no assigned host port")
+	}
+	return uint16(port), nil
+}
+
+func containsForward(forwards []forwardAPI, expected forwardAPI) bool {
+	for _, forward := range forwards {
+		if forward.Local == expected.Local && forward.Remote == expected.Remote && normalizeForwardProtocol(forward.Protocol) == normalizeForwardProtocol(expected.Protocol) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsForwardAt(forwards []forwardAPI, protocol, local string) bool {
+	for _, forward := range forwards {
+		if forward.Local == local && normalizeForwardProtocol(forward.Protocol) == normalizeForwardProtocol(protocol) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeForwardProtocol(protocol string) string {
+	if protocol == "" {
+		return protocolTCP
+	}
+	return protocol
+}
+
+func forwardKey(protocol, local string) string {
+	return normalizeForwardProtocol(protocol) + "|" + local
 }
 
 func waitServicesAPI(ctx context.Context, proc process) error {
@@ -974,7 +1276,7 @@ func guestForwardRemote(port policy.Port) string {
 func portLocal(port policy.Port) string {
 	hostIP := port.HostIP
 	if hostIP == "" {
-		hostIP = "127.0.0.1"
+		hostIP = ipv4Loopback
 	}
 	return net.JoinHostPort(hostIP, strconv.Itoa(int(port.Host)))
 }
@@ -982,16 +1284,14 @@ func portLocal(port policy.Port) string {
 func applyForwardDiffAuth(ctx context.Context, socket, token string, current []forwardAPI, desired map[string]forwardAPI) error {
 	currentSet := make(map[string]struct{}, len(current))
 	for _, forward := range current {
-		protocol := forward.Protocol
-		if protocol == "" {
-			protocol = protocolTCP
-		}
+		protocol := normalizeForwardProtocol(forward.Protocol)
 		if protocol != protocolTCP && protocol != protocolUDP {
 			continue
 		}
-		key := protocol + "|" + forward.Local
-		currentSet[key] = struct{}{}
-		if _, keep := desired[key]; keep {
+		key := forwardKey(protocol, forward.Local)
+		expected, keep := desired[key]
+		if keep && expected.Remote == forward.Remote && normalizeForwardProtocol(expected.Protocol) == protocol {
+			currentSet[key] = struct{}{}
 			continue
 		}
 		if err := postForwardAuth(ctx, socket, token, "/services/forwarder/unexpose", forwardAPI{Local: forward.Local, Protocol: protocol}); err != nil {
@@ -1081,14 +1381,14 @@ func gatewayHTTPClient(endpoint string) (*http.Client, error) {
 	switch {
 	case strings.HasPrefix(endpoint, "tcp://"):
 		u, err := url.Parse(endpoint)
-		if err != nil || u.Scheme != "tcp" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Opaque != "" {
+		if err != nil || u.Scheme != "tcp" || u.Hostname() != ipv4Loopback || u.User != nil || u.Opaque != "" {
 			return nil, errors.New("gateway TCP API must use IPv4 loopback")
 		}
 		port, err := strconv.ParseUint(u.Port(), 10, 16)
 		if err != nil || port == 0 || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 			return nil, errors.New("gateway TCP API endpoint is invalid")
 		}
-		dialNetwork, dialAddress = "tcp", net.JoinHostPort("127.0.0.1", strconv.FormatUint(port, 10))
+		dialNetwork, dialAddress = "tcp", net.JoinHostPort(ipv4Loopback, strconv.FormatUint(port, 10))
 	default:
 		if endpoint == "" {
 			return nil, errors.New("gateway API endpoint is required")
