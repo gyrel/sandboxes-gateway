@@ -45,6 +45,7 @@ sandbox, enforce guest egress, or enable guest registry pulls on their own.
 - audit log path;
 - policy reload rewrites the config, sends SIGHUP, and verifies the patched gvproxy's appended `egress policy reloaded revision=N` log acknowledgement; a missing acknowledgement stops the gateway and fails closed;
 - TCP port forwards;
+- `SetGitDaemon` allocates an assigned IPv4 loopback port for the fixed guest upload-pack endpoint, verifies the full tuple, and returns the port; disabling it removes only the process-owned mapping;
 - deterministic MAC and nerdbox network annotations.
 
 The manager requires a supervisor executable and a patched gvproxy supporting
@@ -61,4 +62,6 @@ authenticate packet-channel clients.
 
 Current tests cover config rendering, MAC derivation, validation, and safe stop.
 An opt-in local test starts and stops a supplied patched gvproxy; it does not
-test a VM or establish policy enforcement. It is not part of CI.
+test a VM or establish policy enforcement. The Git daemon API's unit tests use
+a fake services endpoint; live VM reachability and host Git remote ownership
+remain unverified. The opt-in live gateway test is not part of CI.
