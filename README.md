@@ -15,9 +15,9 @@ Domain UDP rules require the experimental QUIC capability; without it they are
 rejected. Domain denies overlapping a direct IP allow are also rejected.
 Experimental IPv6 policy and guest loopback forwarding require an explicit
 capability flag; QUIC policy requires its own explicit flag. The default keeps
-all of them disabled. HTTP Host/method/path and CONNECT
-enforcement are not implemented or verified. Audit failure behavior has not
-been fully validated.
+all of them disabled. HTTP method, path, and query conditions are modeled,
+validated, and rendered; live gvproxy HTTP enforcement and CONNECT enforcement
+are not verified. Audit failure behavior has not been fully validated.
 
 Policy DNS queries use the configured upstream; a hostname in that configuration
 may require host DNS for bootstrap. Use a numeric upstream address to avoid that
@@ -27,6 +27,46 @@ binding exists or that a subsequent TLS connection will pass SNI checks.
 The `registryauth` package provides host-side parsing, scoped token exchange,
 and restricted transport primitives. These primitives do not authenticate a
 sandbox, enforce guest egress, or enable guest registry pulls on their own.
+
+## Policy HTTP conditions
+
+A `policy.Rule` may carry HTTP conditions in addition to its domain or CIDR
+selector and optional protocol. The model is additive: a rule with no HTTP
+conditions keeps matching every transport selected by its domain or CIDR.
+
+- `Methods` is an exact, case-insensitive list of `GET`, `HEAD`, `POST`, `PUT`,
+  `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or `TRACE`. `ANY` matches every
+  method while keeping the rule HTTP-only. An empty list means no method
+  restriction. Empty entries and unknown methods are rejected.
+- `Path` is an absolute path glob. `*` matches any run of characters inside one
+  segment, `?` matches one character, `[abc]` and `[!abc]` are character
+  classes, and `**` as a whole segment matches zero or more segments. The
+  default is `/**`, which matches every path. A path must start with `/`;
+  query strings, fragments, whitespace, escapes, and `..` segments are
+  rejected.
+- `Query` is an ordered list of `name=value` requirements. The name is exact;
+  the value may be a glob using the same single-segment syntax. Every listed
+  parameter must be present, but extra request parameters are allowed. A
+  repeated name matches when any of its values matches.
+- `Protocol` remains optional. HTTP conditions are evaluated only for TCP
+  requests; a UDP flow or a request with no HTTP metadata never matches a
+  conditional rule.
+
+Parse conditions with `policy.ParseMethods`, `policy.ParsePath`,
+`policy.ParseQuery`, and `policy.ParseQueryList`, or validate a rule with
+`policy.Rule.ValidateHTTPConditions`. Invalid conditions are rejected at
+validation time; `policy.Check` and the gateway config writer fail closed
+instead of widening a conditional rule.
+
+`policy.ParseHTTPRequestHead` parses the bounded request line of an HTTP/1.x
+request and returns `Method`, `Path`, `RawQuery`, and parsed `Query` metadata
+for `policy.Check`. It reads no body and caps the inspected head at
+`policy.MaxHTTPRequestHeadBytes`.
+
+Deny rules are evaluated before allow rules, so a matching conditional deny
+wins over an allow. `policy.Check` is a local matcher: it does not prove that a
+DNS binding exists or that the pinned gvproxy datapath enforces HTTP
+conditions. That live datapath behavior remains unverified.
 
 ## Boundaries
 
