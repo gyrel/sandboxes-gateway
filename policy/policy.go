@@ -18,7 +18,9 @@ const (
 	protocolTCP        = "tcp"
 )
 
-// Rule is a single policy rule.
+// Rule is a single policy rule. Methods, Path and Query restrict an HTTP
+// request; a rule with no HTTP conditions applies to every transport that its
+// domain or CIDR selector matches.
 type Rule struct {
 	ID       string
 	Action   Action
@@ -26,6 +28,9 @@ type Rule struct {
 	Domain   string
 	CIDR     string
 	Port     uint16
+	Methods  []string
+	Path     string
+	Query    []QueryParam
 }
 
 // Port maps a host loopback address/port to a guest port.
@@ -55,13 +60,18 @@ type Decision struct {
 }
 
 // Request is a single network authorization request. Domain is used for a
-// hostname target; Address is used for an IP target. HTTP fields are reserved
-// for the HTTP policy phase.
+// hostname target; Address is used for an IP target. Method, Path, Query and
+// RawQuery describe the HTTP request when one is available. A rule with HTTP
+// conditions never matches a request that omits them.
 type Request struct {
 	Protocol string
 	Address  string
 	Domain   string
 	Port     uint16
+	Method   string
+	Path     string
+	Query    map[string][]string
+	RawQuery string
 }
 
 // Evaluate fails closed until a policy engine is configured.
@@ -110,18 +120,19 @@ func ValidateEnforcement(allow, deny []Rule) error {
 // the supplied capabilities. A disabled capability always fails closed.
 func ValidateEnforcementWith(allow, deny []Rule, capabilities Capabilities) error {
 	for _, rules := range [][]Rule{allow, deny} {
-		for _, rule := range rules {
-			if err := validateEnforcementRule(rule, capabilities); err != nil {
+		for i := range rules {
+			if err := validateEnforcementRule(rules[i], capabilities); err != nil {
 				return err
 			}
 		}
 	}
-	for _, denied := range deny {
+	for i := range deny {
+		denied := &deny[i]
 		if denied.Domain == "" {
 			continue
 		}
-		for _, granted := range allow {
-			if domainDenyConflictsWithIPAllow(denied, granted) {
+		for j := range allow {
+			if domainDenyConflictsWithIPAllow(*denied, allow[j]) {
 				return errors.New("domain deny conflicts with direct IP allow; enforcement unsupported")
 			}
 		}
@@ -143,6 +154,9 @@ func ambiguousIPv4MappedPrefix(cidr string) bool {
 }
 
 func validateEnforcementRule(rule Rule, capabilities Capabilities) error {
+	if err := rule.ValidateHTTPConditions(); err != nil {
+		return err
+	}
 	if rule.Domain != "" && net.ParseIP(strings.TrimSpace(rule.Domain)) != nil {
 		return errors.New("domain rule must not be an IP literal; use a CIDR rule")
 	}
@@ -185,6 +199,9 @@ func ruleMatches(rule Rule, protocol string, req Request) bool {
 		return false
 	}
 	if rule.Port != 0 && rule.Port != req.Port {
+		return false
+	}
+	if !httpRequestMatches(rule, protocol, req) {
 		return false
 	}
 	if rule.Domain != "" {

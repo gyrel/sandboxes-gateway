@@ -708,7 +708,11 @@ func validatePolicy(p policy.Policy, quicEnabled bool) error {
 }
 
 func validatePolicyRules(rules []policy.Rule, name string) error {
-	for i, rule := range rules {
+	for i := range rules {
+		rule := &rules[i]
+		if err := rule.ValidateHTTPConditions(); err != nil {
+			return fmt.Errorf("%s rule %d: %w", name, i, err)
+		}
 		protocol := strings.ToLower(strings.TrimSpace(rule.Protocol))
 		if protocol != protocolTCP && protocol != protocolUDP {
 			return fmt.Errorf("%s rule %d: protocol must be tcp or udp", name, i)
@@ -736,8 +740,8 @@ func validateDomainUpstream(p policy.Policy, dnsUpstream string) error {
 		return nil
 	}
 	for _, rules := range [][]policy.Rule{p.Allow, p.Deny} {
-		for _, rule := range rules {
-			if rule.Domain != "" {
+		for i := range rules {
+			if rules[i].Domain != "" {
 				return errors.New("domain policy requires a DNS upstream (--dns-upstream or settings dns.upstream)")
 			}
 		}
@@ -815,7 +819,8 @@ func validateIPv6RuleCapability(allow, deny []policy.Rule, ipv6Enabled bool) err
 		name  string
 		rules []policy.Rule
 	}{{"allow", allow}, {"deny", deny}} {
-		for index, rule := range scope.rules {
+		for index := range scope.rules {
+			rule := &scope.rules[index]
 			if rule.CIDR == "" {
 				continue
 			}
@@ -897,23 +902,42 @@ func writeRules(b *strings.Builder, name string, rules []policy.Rule) {
 		return
 	}
 	fmt.Fprintf(b, "    %s:\n", name)
-	for _, r := range rules {
-		proto := r.Protocol
-		if proto == "" {
-			proto = protocolTCP
+	for i := range rules {
+		writeRule(b, &rules[i])
+	}
+}
+
+func writeRule(b *strings.Builder, r *policy.Rule) {
+	proto := r.Protocol
+	if proto == "" {
+		proto = protocolTCP
+	}
+	fmt.Fprintf(b, "      - protocol: %s\n", strconv.Quote(proto))
+	if r.ID != "" {
+		fmt.Fprintf(b, "        id: %s\n", strconv.Quote(r.ID))
+	}
+	if r.CIDR != "" {
+		fmt.Fprintf(b, "        cidr: %s\n", strconv.Quote(r.CIDR))
+	}
+	if r.Domain != "" {
+		fmt.Fprintf(b, "        domain: %s\n", strconv.Quote(r.Domain))
+	}
+	if r.Port != 0 {
+		fmt.Fprintf(b, "        port: %d\n", r.Port)
+	}
+	if len(r.Methods) > 0 {
+		b.WriteString("        methods:\n")
+		for _, method := range policy.CanonicalMethods(r.Methods) {
+			fmt.Fprintf(b, "          - %s\n", strconv.Quote(method))
 		}
-		fmt.Fprintf(b, "      - protocol: %s\n", strconv.Quote(proto))
-		if r.ID != "" {
-			fmt.Fprintf(b, "        id: %s\n", strconv.Quote(r.ID))
-		}
-		if r.CIDR != "" {
-			fmt.Fprintf(b, "        cidr: %s\n", strconv.Quote(r.CIDR))
-		}
-		if r.Domain != "" {
-			fmt.Fprintf(b, "        domain: %s\n", strconv.Quote(r.Domain))
-		}
-		if r.Port != 0 {
-			fmt.Fprintf(b, "        port: %d\n", r.Port)
+	}
+	if r.Path != "" {
+		fmt.Fprintf(b, "        path: %s\n", strconv.Quote(r.Path))
+	}
+	if len(r.Query) > 0 {
+		b.WriteString("        query:\n")
+		for _, query := range policy.CanonicalQuery(r.Query) {
+			fmt.Fprintf(b, "          - name: %s\n            value: %s\n", strconv.Quote(query.Name), strconv.Quote(query.Value))
 		}
 	}
 }
