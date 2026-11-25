@@ -25,7 +25,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 func checkGatewayPlatform() error { return ErrWindowsTransportUnavailable }

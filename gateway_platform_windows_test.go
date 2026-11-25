@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 func TestWindowsGatewayStartFailsClosedBeforeCreatingResources(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 func TestValidCorrelationID(t *testing.T) {

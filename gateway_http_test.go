@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 func TestWriteConfigRendersHTTPConditions(t *testing.T) {

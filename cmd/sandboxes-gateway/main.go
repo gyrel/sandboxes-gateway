@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/rheic/sandboxes-gateway/internal/version"
+	"github.com/gyrel/sandboxes-gateway/internal/version"
 )
 
 func main() {

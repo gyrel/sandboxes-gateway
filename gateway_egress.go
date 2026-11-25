@@ -3,7 +3,7 @@ package gateway
 import (
 	"strconv"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 // gatewayEgressRule is the wire form of one egress policy rule for the gateway
