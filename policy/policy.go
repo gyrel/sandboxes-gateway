@@ -46,9 +46,16 @@ type Policy struct {
 	Revision  int
 	SandboxID string
 	AuditPath string
-	Allow     []Rule
-	Deny      []Rule
-	Ports     []Port
+	// OpID and ReqID are optional correlation identifiers handed to the
+	// gateway purely to stamp audit lines. They are evidence only and never
+	// influence policy enforcement. Each value must match the gateway's
+	// correlation charset and length (^[A-Za-z0-9_-]{1,64}$); anything else is
+	// omitted from the rendered config rather than sanitized or fabricated.
+	OpID  string
+	ReqID string
+	Allow []Rule
+	Deny  []Rule
+	Ports []Port
 }
 
 // Decision is the result of policy evaluation.

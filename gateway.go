@@ -88,6 +88,12 @@ type process struct {
 	lease      io.Closer
 	forwardMu  *sync.Mutex
 	gitForward *forwardAPI
+	// opID and reqID record the most recent correlation ids handed to this
+	// sandbox's handle. They are evidence-only metadata for audit stamping,
+	// guarded by the manager mutex, and best-effort: Reload reuses them only
+	// when a pushed policy revision omits its own correlation ids.
+	opID  string
+	reqID string
 	// stopping marks an orderly stop so the exit watcher does not report a
 	// host-initiated shutdown as an unexpected gateway loss.
 	stopping bool
@@ -310,7 +316,7 @@ func (m *Manager) launch(ctx context.Context, p policy.Policy, socket, cfgPath, 
 		_ = lease.Close()
 		close(done)
 	}()
-	proc := process{cmd: cmd, done: done, socket: socket, cfgPath: cfgPath, logPath: logPath, apiSocket: apiSocket, apiToken: apiToken, tokenPath: tokenPath, revision: p.Revision, lease: lease, forwardMu: &sync.Mutex{}}
+	proc := process{cmd: cmd, done: done, socket: socket, cfgPath: cfgPath, logPath: logPath, apiSocket: apiSocket, apiToken: apiToken, tokenPath: tokenPath, revision: p.Revision, lease: lease, forwardMu: &sync.Mutex{}, opID: p.OpID, reqID: p.ReqID}
 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
@@ -380,6 +386,24 @@ func validSandboxID(id string) bool {
 			(c < '0' || c > '9') && c != '-' && c != '_' && c != '.' {
 			return false
 		}
+	}
+	return true
+}
+
+// validCorrelationID mirrors the gateway's correlation identifier charset and
+// length: ^[A-Za-z0-9_-]{1,64}$. An empty or invalid id is omitted from the
+// rendered config rather than sanitized or fabricated.
+func validCorrelationID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' {
+			continue
+		}
+		return false
 	}
 	return true
 }
@@ -535,6 +559,41 @@ func (m *Manager) stopProcess(ctx context.Context, name string, p process) error
 // ErrReloadUnverified reports that the current gvproxy has no revision ACK.
 var ErrReloadUnverified = errors.New("gateway policy reload has no verified acknowledgement")
 
+// SetCorrelation records the most recent operation and request correlation ids
+// for a sandbox handle. Reload stamps them onto audit lines when a pushed
+// policy revision omits its own ids (best-effort: the daemon can refresh them
+// per operation by calling SetCorrelation again). The ids are evidence-only
+// metadata and never affect policy enforcement; invalid or empty ids are
+// omitted at render time. A sandbox that is not running is ignored.
+func (m *Manager) SetCorrelation(name, op, req string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	proc, ok := m.procs[name]
+	if !ok {
+		return
+	}
+	proc.opID = op
+	proc.reqID = req
+	m.procs[name] = proc
+}
+
+// effectiveCorrelation returns the correlation ids to stamp for a policy
+// revision: the revision's own ids win, and empty fields fall back to the
+// handle's most recently recorded ids.
+func effectiveCorrelation(policyOp, policyReq, recordedOp, recordedReq string) (string, string) {
+	op, req := policyOp, policyReq
+	if op == "" {
+		op = recordedOp
+	}
+	if req == "" {
+		req = recordedReq
+	}
+	return op, req
+}
+
 // Reload rewrites the gateway config, asks the platform control channel to
 // apply the policy, and verifies its revision acknowledgement. Without an
 // acknowledgement the gateway is stopped and the error fails closed.
@@ -568,6 +627,9 @@ func (m *Manager) Reload(ctx context.Context, p policy.Policy) error {
 	if p.Revision <= proc.revision {
 		return fmt.Errorf("policy revision %d must advance past %d", p.Revision, proc.revision)
 	}
+	// Best-effort correlation stamping: when this revision carries no
+	// correlation ids, reuse the most recent ones recorded for the handle.
+	p.OpID, p.ReqID = effectiveCorrelation(p.OpID, p.ReqID, proc.opID, proc.reqID)
 	if err := writeConfig(proc.cfgPath, p, m.cfg.DNSUpstream, m.cfg.IPv6Enabled, m.cfg.QUICEnabled); err != nil {
 		return err
 	}
@@ -586,6 +648,8 @@ func (m *Manager) Reload(ctx context.Context, p policy.Policy) error {
 	m.mu.Lock()
 	if current, ok := m.procs[p.SandboxID]; ok && current.cmd == proc.cmd {
 		current.revision = p.Revision
+		current.opID = p.OpID
+		current.reqID = p.ReqID
 		m.procs[p.SandboxID] = current
 	}
 	m.mu.Unlock()
@@ -891,6 +955,12 @@ func renderConfig(p policy.Policy, dnsUpstream string, ipv6Enabled bool) string 
 	b.WriteString("  egressPolicy:\n")
 	fmt.Fprintf(&b, "    revision: %s\n", strconv.Quote(strconv.Itoa(p.Revision)))
 	fmt.Fprintf(&b, "    sandboxID: %s\n", strconv.Quote(p.SandboxID))
+	if validCorrelationID(p.OpID) {
+		fmt.Fprintf(&b, "    opID: %s\n", strconv.Quote(p.OpID))
+	}
+	if validCorrelationID(p.ReqID) {
+		fmt.Fprintf(&b, "    reqID: %s\n", strconv.Quote(p.ReqID))
+	}
 	fmt.Fprintf(&b, "    auditLog: %s\n", strconv.Quote(p.AuditPath))
 	writeRules(&b, "allow", p.Allow)
 	writeRules(&b, "deny", p.Deny)

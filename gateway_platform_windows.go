@@ -211,17 +211,7 @@ func reloadGateway(ctx context.Context, proc process, next policy.Policy, _ int6
 	if err := validateGatewayAPIAuth(proc.apiSocket, proc.apiToken); err != nil {
 		return err
 	}
-	allow, deny := make([]gatewayEgressRule, 0, len(next.Allow)), make([]gatewayEgressRule, 0, len(next.Deny))
-	for _, rule := range next.Allow {
-		allow = append(allow, gatewayRule(rule))
-	}
-	for _, rule := range next.Deny {
-		deny = append(deny, gatewayRule(rule))
-	}
-	payload, err := json.Marshal(gatewayEgressPolicy{
-		Revision: strconv.Itoa(next.Revision), SandboxID: next.SandboxID,
-		Allow: allow, Deny: deny, AuditLog: next.AuditPath,
-	})
+	payload, err := json.Marshal(gatewayEgressPolicyFor(next))
 	if err != nil {
 		return fmt.Errorf("encode gateway egress policy: %w", err)
 	}
@@ -253,31 +243,6 @@ func reloadGateway(ctx context.Context, proc process, next policy.Policy, _ int6
 		return ErrReloadUnverified
 	}
 	return nil
-}
-
-type gatewayEgressRule struct {
-	ID       string `json:"id,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
-	CIDR     string `json:"cidr,omitempty"`
-	Port     uint16 `json:"port,omitempty"`
-	Domain   string `json:"domain,omitempty"`
-}
-
-type gatewayEgressPolicy struct {
-	Revision  string              `json:"revision"`
-	SandboxID string              `json:"sandboxID"`
-	AllowAny  bool                `json:"allowAny,omitempty"`
-	Allow     []gatewayEgressRule `json:"allow,omitempty"`
-	Deny      []gatewayEgressRule `json:"deny,omitempty"`
-	AuditLog  string              `json:"auditLog,omitempty"`
-}
-
-func gatewayRule(rule policy.Rule) gatewayEgressRule {
-	protocol := rule.Protocol
-	if protocol == "" {
-		protocol = "tcp"
-	}
-	return gatewayEgressRule{ID: rule.ID, Protocol: protocol, CIDR: rule.CIDR, Port: rule.Port, Domain: rule.Domain}
 }
 
 func validateGatewayAPIAuth(endpoint, token string) error {
