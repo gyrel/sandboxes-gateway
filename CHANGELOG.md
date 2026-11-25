@@ -24,6 +24,14 @@
 - Reconcile port forwards by local address, protocol, and guest endpoint; keep
   managed Git forwarding during ordinary port updates and withdraw it only by
   its recorded ownership tuple.
+- Pass optional operation and request correlation ids (`opID`/`reqID`) through
+  policy provisioning so gvproxy can stamp audit lines with the daemon's
+  operation identity. `policy.Policy` gains `OpID`/`ReqID`, and
+  `Manager.SetCorrelation` records the most recent ids for a sandbox handle so a
+  per-revision policy push that omits them still stamps the last known pair.
+  Ids are evidence-only: values outside `^[A-Za-z0-9_-]{1,64}$` are omitted from
+  the rendered config rather than sanitized, and they never influence policy
+  enforcement.
 
 ### Security and limitations
 
