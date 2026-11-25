@@ -33,6 +33,12 @@
   the rendered config rather than sanitized, and they never influence policy
   enforcement.
 
+### Changed
+
+- Rename the Go module path from `github.com/rheic/sandboxes-gateway` to
+  `github.com/gyrel/sandboxes-gateway`. Breaking for pre-1.0 alpha consumers;
+  the previous path is not kept as a compatibility alias.
+
 ### Security and limitations
 
 - HTTP conditions are validated and rendered, but live gvproxy enforcement is

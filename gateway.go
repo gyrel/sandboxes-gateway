@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rheic/sandboxes-gateway/policy"
+	"github.com/gyrel/sandboxes-gateway/policy"
 )
 
 const (
