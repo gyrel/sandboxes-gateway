@@ -531,6 +531,53 @@ func TestIPv6HostForwardRequiresExplicitCapability(t *testing.T) {
 	}
 }
 
+func TestValidatePolicyPortsValidatesShapeNotBindPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    policy.Port
+		wantErr string
+	}{
+		{name: "ipv4 loopback", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "127.0.0.1"}},
+		{name: "ipv6 loopback", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "::1"}},
+		{name: "specific non-loopback ipv4", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "100.64.0.8"}},
+		{name: "specific non-loopback ipv6", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "2001:db8::8"}},
+		{name: "empty host ip", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp"}},
+		{name: "udp protocol", port: policy.Port{Host: 8080, Guest: 3000, Proto: "udp", HostIP: "100.64.0.8"}},
+		{name: "invalid host ip", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "not-an-ip"}, wantErr: "invalid host IP"},
+		{name: "unspecified ipv4", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "0.0.0.0"}, wantErr: "specific address"},
+		{name: "unspecified ipv6", port: policy.Port{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "::"}, wantErr: "specific address"},
+		{name: "sctp protocol", port: policy.Port{Host: 8080, Guest: 3000, Proto: "sctp", HostIP: "127.0.0.1"}, wantErr: "protocol must be tcp or udp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePolicyPorts([]policy.Port{tt.port})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validatePolicyPorts(%+v) error = %v", tt.port, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validatePolicyPorts(%+v) accepted; want error containing %q", tt.port, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validatePolicyPorts(%+v) error = %q; want containing %q", tt.port, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidatePolicyPortsPassesSpecificAddressToForwarder(t *testing.T) {
+	ports := []policy.Port{{Host: 8080, Guest: 3000, Proto: "tcp", HostIP: "100.64.0.8"}}
+	if err := validatePolicyPorts(ports); err != nil {
+		t.Fatalf("specific non-loopback address rejected: %v", err)
+	}
+	forwards := desiredForwards(ports)
+	if got := forwards["tcp|100.64.0.8:8080"].Local; got != "100.64.0.8:8080" {
+		t.Fatalf("forward local = %q, want specific non-loopback bind passed through", got)
+	}
+}
+
 func TestIPv6CIDRRuleRequiresExplicitCapability(t *testing.T) {
 	rules := []policy.Rule{{Protocol: "tcp", CIDR: "2001:db8::/32", Port: 443}}
 	if err := validateIPv6RuleCapability(rules, nil, false); err == nil {
