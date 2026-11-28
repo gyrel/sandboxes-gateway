@@ -71,14 +71,15 @@ type Decision struct {
 // RawQuery describe the HTTP request when one is available. A rule with HTTP
 // conditions never matches a request that omits them.
 type Request struct {
-	Protocol string
-	Address  string
-	Domain   string
-	Port     uint16
-	Method   string
-	Path     string
-	Query    map[string][]string
-	RawQuery string
+	Protocol   string
+	Address    string
+	Domain     string
+	Port       uint16
+	Method     string
+	Path       string
+	Query      map[string][]string
+	RawQuery   string
+	DNSAnswers []netip.Addr
 }
 
 // Evaluate fails closed until a policy engine is configured.
@@ -92,6 +93,18 @@ func Evaluate(rule Rule) Decision {
 func Check(allow, deny []Rule, req Request) Decision {
 	if err := ValidateEnforcement(allow, deny); err != nil {
 		return Decision{Allow: false, Reason: err.Error()}
+	}
+	if len(req.DNSAnswers) > 0 {
+		if err := ValidateDNSAnswers(req.DNSAnswers); err != nil {
+			return Decision{Allow: false, Reason: "DNS answer validation failed: " + err.Error()}
+		}
+	}
+	if req.Domain != "" && req.Address != "" {
+		if addr, err := netip.ParseAddr(strings.TrimSpace(req.Address)); err == nil {
+			if !IsPublicAddress(addr) {
+				return Decision{Allow: false, Reason: "resolved domain address is non-public"}
+			}
+		}
 	}
 	protocol := strings.ToLower(strings.TrimSpace(req.Protocol))
 	if protocol == "" {
