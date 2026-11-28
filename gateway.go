@@ -867,9 +867,15 @@ func validatePolicyPorts(ports []policy.Port) error {
 		if port.HostIP == "" {
 			continue
 		}
+		// The gateway validates shape only. Whether a specific non-loopback
+		// address may be published is the daemon's bind policy (allowlist /
+		// BIND_FORBIDDEN); refusing it here would bypass that decision.
 		ip := net.ParseIP(port.HostIP)
-		if ip == nil || !ip.IsLoopback() {
-			return fmt.Errorf("port %d: host IP must be loopback", i)
+		if ip == nil {
+			return fmt.Errorf("port %d: invalid host IP %q", i, port.HostIP)
+		}
+		if ip.IsUnspecified() {
+			return fmt.Errorf("port %d: host IP must be a specific address", i)
 		}
 	}
 	return nil
